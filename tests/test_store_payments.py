@@ -3,9 +3,9 @@ import tempfile
 
 import pytest
 
-from core.config import MILLION
-from core.payments import credits_price, fmt_chars, fulfil, parse_millions, plan_summary
-from core.store import Store
+from bot import MILLION
+from bot import credits_price, fmt_chars, fulfil, parse_millions, plan_summary
+from bot import Store
 
 FREE = MILLION
 
