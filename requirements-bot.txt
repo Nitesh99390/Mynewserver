@@ -1,0 +1,8 @@
+pyrogram>=2.0
+tgcrypto
+aiohttp
+ebooklib
+beautifulsoup4
+lxml
+python-dotenv
+razorpay
