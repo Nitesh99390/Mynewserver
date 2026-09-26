@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+data.json
+data.json.tmp
+*.session
+*.session-journal
+downloads/
+*.epub
