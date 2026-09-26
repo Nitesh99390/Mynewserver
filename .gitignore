@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 .env
-data.json
-data.json.tmp
+data/
+downloads/
 *.session
 *.session-journal
-downloads/
-*.epub
+*.sqlite3*
+*.log
+data.json*
+.pytest_cache/
+.vercel/

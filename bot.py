@@ -1,688 +1,853 @@
 """
-Master Bot  (Telegram EPUB Translator)
-=======================================
-Receives EPUB files on Telegram, splits the text into batches and sends them
-to one or more Translation Workers (app.py) running on free hosts.
-Translated EPUB is rebuilt *in place* so images, CSS, TOC and covers survive.
+EPUB Translator – Master Bot  v3
+================================
+Runs on your own server (Oracle VPS etc.).  Receives EPUB files on Telegram,
+splits the text into batches, fans them out to the translation workers
+(app.py) hosted on Render / Vercel free tiers, rebuilds the EPUB and sends it
+back.
 
-Environment (.env supported)
-----------------------------
-API_ID, API_HASH, BOT_TOKEN      Telegram credentials (required)
-OWNER_ID                         Admin Telegram user id
-WORKER_SECRET                    Optional, must match the workers' WORKER_SECRET
-RAZORPAY_KEY_ID / _SECRET        Optional, enables /pay
-FREE_DAILY_LIMIT                 Files per day for non-premium users (default 2)
-DATA_FILE                        Persistence file (default data.json)
+    pip install -r requirements-bot.txt
+    cp .env.example .env        # fill API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+    python bot.py
+
+See README.md for the full deployment guide (systemd unit included).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import logging.handlers
 import os
-import re
+import signal
 import time
-from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
-import aiohttp
-import ebooklib
-from bs4 import BeautifulSoup, NavigableString, Comment
-from dotenv import load_dotenv
-from ebooklib import epub
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+from pyrogram import Client, enums, filters
+from pyrogram.errors import FloodWait, MessageNotModified, RPCError
+from pyrogram.types import CallbackQuery, Message
 
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("master")
+from core import ui
+from core.config import LANGUAGES, MILLION, lang_name, settings
+from core.epub_engine import EpubError, cleanup
+from core.jobs import Job, JobManager, Pending
+from core.payments import Razorpay, credits_price, fmt_chars, fulfil, parse_millions, plan_summary
+from core.store import Store
+from core.workers import WorkerPool
 
 # --------------------------------------------------------------------------- #
-# Config
+# Bootstrap
 # --------------------------------------------------------------------------- #
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "").strip()
-RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
-FREE_DAILY_LIMIT = int(os.environ.get("FREE_DAILY_LIMIT", "2"))
-DATA_FILE = os.environ.get("DATA_FILE", "data.json")
-PREMIUM_PRICE_INR = int(os.environ.get("PREMIUM_PRICE_INR", "100"))
+settings.validate()
 
-BATCH_SIZE = 40                 # texts per worker request
-BATCH_CHARS = 4000              # chars per worker request
-MAX_PARALLEL_BATCHES = 8        # concurrent requests across all workers
-WORKER_TIMEOUT = aiohttp.ClientTimeout(total=60)
-KEEPALIVE_INTERVAL = 600        # seconds
-WORKER_FAIL_COOLDOWN = 120      # seconds a failing worker is skipped
+_handlers: list = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.handlers.RotatingFileHandler(settings.log_file, maxBytes=5_000_000, backupCount=3,
+                                                          encoding="utf-8"))
+except OSError:
+    pass
+logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=_handlers)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+log = logging.getLogger("bot")
 
-# Tags whose text should never be translated
-SKIP_TAGS = {"script", "style", "code", "pre", "kbd", "samp", "var", "math", "svg", "title"}
-_NON_TEXT = re.compile(r"^[\W\d_]+$", re.UNICODE)   # numbers / punctuation only
+store = Store(settings.db_file)
+store.migrate_legacy_json(settings.legacy_json)
+pool = WorkerPool(store)
+jobs = JobManager(store, pool)
+rzp = Razorpay()
 
-LANGUAGES = {
-    "hi": "Hindi", "bn": "Bengali", "ta": "Tamil", "te": "Telugu",
-    "mr": "Marathi", "gu": "Gujarati", "ur": "Urdu", "kn": "Kannada",
-    "ml": "Malayalam", "pa": "Punjabi", "en": "English",
-}
+app = Client("epub_translator", api_id=settings.api_id, api_hash=settings.api_hash, bot_token=settings.bot_token,
+             workdir=settings.data_dir, parse_mode=enums.ParseMode.HTML, sleep_threshold=30)
 
-# Optional Razorpay
-rzp_client = None
-if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+state: Dict[int, dict] = {}          # transient conversational state: user_id -> {"mode": ..}
+_last_edit: Dict[int, float] = {}    # job_id -> last progress edit timestamp
+
+ADMIN_CMDS = ["admin", "grant", "credits", "revoke", "ban", "unban", "user", "stats", "workers"]
+USER_CMDS = ["start", "help", "plan", "lang", "buy", "pay", "cancel"]
+
+
+def is_admin(uid: int) -> bool:
+    return settings.is_admin(uid)
+
+
+admin_only = filters.create(lambda _, __, m: bool(m.from_user) and is_admin(m.from_user.id))
+
+
+# --------------------------------------------------------------------------- #
+# Safe Telegram helpers – never raise into handlers
+# --------------------------------------------------------------------------- #
+async def safe_edit(chat_id: int, msg_id: int, text: str, reply_markup=None) -> bool:
     try:
-        import razorpay  # type: ignore
-
-        rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-    except Exception as exc:  # pragma: no cover
-        log.warning("Razorpay disabled: %s", exc)
-
-app = Client("TranslatorBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --------------------------------------------------------------------------- #
-# Persistence
-# --------------------------------------------------------------------------- #
-WORKERS: List[str] = []
-users_db: Dict[int, dict] = {}
-admin_state: Dict[int, str] = {}
-worker_failures: Dict[str, float] = {}      # url -> timestamp of last failure
-worker_stats: Dict[str, dict] = {}          # url -> {"ok": n, "fail": n}
-
-
-def load_data() -> None:
-    global WORKERS, users_db
-    if not os.path.exists(DATA_FILE):
-        return
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        WORKERS = [w.rstrip("/") for w in data.get("workers", [])]
-        users_db = {int(k): v for k, v in data.get("users_db", {}).items()}
-    except Exception as exc:
-        log.error("Data load error: %s", exc)
-
-
-def save_data() -> None:
-    try:
-        tmp = DATA_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"workers": WORKERS, "users_db": users_db}, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, DATA_FILE)
-    except Exception as exc:
-        log.error("Data save error: %s", exc)
-
-
-load_data()
-
-
-def get_user(user_id: int) -> dict:
-    u = users_db.setdefault(user_id, {"lang": "hi", "has_subscription": False, "premium_until": None,
-                                      "daily": {"date": "", "count": 0}})
-    u.setdefault("daily", {"date": "", "count": 0})
-    return u
-
-
-def is_premium(user_id: int) -> bool:
-    if user_id == OWNER_ID:
+        await app.edit_message_text(chat_id, msg_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
         return True
-    u = get_user(user_id)
-    until = u.get("premium_until")
-    if until and until >= date.today().isoformat():
+    except MessageNotModified:
         return True
-    return bool(u.get("has_subscription"))
+    except FloodWait as fw:
+        await asyncio.sleep(min(int(fw.value), 30))
+        return False
+    except (RPCError, Exception) as exc:  # noqa: BLE001
+        log.debug("edit failed: %s", exc)
+        return False
 
 
-def check_daily_quota(user_id: int) -> Tuple[bool, int]:
-    """Return (allowed, remaining)."""
-    if is_premium(user_id):
-        return True, 9999
-    u = get_user(user_id)
-    today = date.today().isoformat()
-    if u["daily"]["date"] != today:
-        u["daily"] = {"date": today, "count": 0}
-    remaining = FREE_DAILY_LIMIT - u["daily"]["count"]
-    return remaining > 0, max(remaining, 0)
-
-
-def consume_quota(user_id: int) -> None:
-    if is_premium(user_id):
-        return
-    u = get_user(user_id)
-    u["daily"]["count"] += 1
-    save_data()
-
-
-# --------------------------------------------------------------------------- #
-# Queue
-# --------------------------------------------------------------------------- #
-translation_queue: asyncio.Queue = asyncio.Queue()
-active_tasks: Dict[int, str] = {}
-
-
-def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("🌐 Set Language"), KeyboardButton("💳 Premium (/pay)")],
-        [KeyboardButton("📊 Queue Status"), KeyboardButton("❓ Help")],
-    ]
-    if user_id == OWNER_ID:
-        buttons.append([KeyboardButton("➕ Add Worker"), KeyboardButton("➖ Del Worker")])
-        buttons.append([KeyboardButton("🖥 Worker List"), KeyboardButton("🧹 Clear Stuck Tasks")])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-
-# --------------------------------------------------------------------------- #
-# Worker communication
-# --------------------------------------------------------------------------- #
-def _headers() -> dict:
-    return {"X-Worker-Secret": WORKER_SECRET} if WORKER_SECRET else {}
-
-
-def healthy_workers() -> List[str]:
-    now = time.time()
-    return [w for w in WORKERS if now - worker_failures.get(w, 0) > WORKER_FAIL_COOLDOWN]
-
-
-def _mark(worker: str, ok: bool) -> None:
-    s = worker_stats.setdefault(worker, {"ok": 0, "fail": 0})
-    if ok:
-        s["ok"] += 1
-        worker_failures.pop(worker, None)
-    else:
-        s["fail"] += 1
-        worker_failures[worker] = time.time()
-
-
-async def keep_workers_alive() -> None:
-    """Ping every worker so free-tier hosts don't go to sleep."""
-    while True:
-        if WORKERS:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                for worker in list(WORKERS):
-                    try:
-                        async with session.get(f"{worker}/") as r:
-                            if r.status == 200:
-                                worker_failures.pop(worker, None)
-                    except Exception:
-                        pass
-        await asyncio.sleep(KEEPALIVE_INTERVAL)
-
-
-async def check_worker(session: aiohttp.ClientSession, url: str) -> Tuple[bool, str]:
-    try:
-        async with session.get(f"{url}/health", headers=_headers()) as r:
-            if r.status != 200:
-                return False, f"HTTP {r.status}"
-            data = await r.json(content_type=None)
-            return True, f"v{data.get('version', '?')} up {data.get('uptime_s', 0)}s"
-    except Exception as exc:
-        return False, str(exc)[:60]
-
-
-async def translate_batch_req(session: aiohttp.ClientSession, text_list: List[str],
-                              target_lang: str, worker_hint: int) -> List[str]:
-    """
-    Send a batch to a worker; on failure, fall over to the other workers.
-    Never raises – returns the original texts as a last resort.
-    """
-    candidates = healthy_workers() or list(WORKERS)
-    if not candidates:
-        raise RuntimeError("All workers are offline or deleted!")
-    # rotate so different batches start at different workers
-    start = worker_hint % len(candidates)
-    order = candidates[start:] + candidates[:start]
-
-    for worker in order:
-        for attempt in range(2):
-            try:
-                async with session.post(
-                    f"{worker}/translate",
-                    json={"text_list": text_list, "lang": target_lang},
-                    headers=_headers(),
-                ) as resp:
-                    if resp.status == 401:
-                        log.error("Worker %s rejected secret", worker)
-                        _mark(worker, False)
-                        break
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    result = await resp.json(content_type=None)
-                if result.get("success") and isinstance(result.get("translated"), list) \
-                        and len(result["translated"]) == len(text_list):
-                    _mark(worker, True)
-                    return result["translated"]
-                raise RuntimeError(result.get("error", "bad response"))
-            except Exception as exc:
-                log.warning("Worker %s failed (%s) attempt %d", worker, exc, attempt + 1)
-                await asyncio.sleep(1.5)
-        _mark(worker, False)
-    return text_list
-
-
-# --------------------------------------------------------------------------- #
-# EPUB processing
-# --------------------------------------------------------------------------- #
-def collect_text_nodes(soup: BeautifulSoup) -> List[NavigableString]:
-    """Every translatable text node, in document order. Structure stays intact."""
-    nodes: List[NavigableString] = []
-    body = soup.body or soup
-    for node in body.descendants:
-        if not isinstance(node, NavigableString) or isinstance(node, Comment):
-            continue
-        text = str(node)
-        if not text.strip() or _NON_TEXT.match(text.strip()):
-            continue
-        if any(p.name in SKIP_TAGS for p in node.parents if getattr(p, "name", None)):
-            continue
-        nodes.append(node)
-    return nodes
-
-
-def make_batches(texts: List[str]) -> List[List[int]]:
-    batches: List[List[int]] = []
-    cur: List[int] = []
-    chars = 0
-    for i, t in enumerate(texts):
-        if cur and (len(cur) >= BATCH_SIZE or chars + len(t) > BATCH_CHARS):
-            batches.append(cur)
-            cur, chars = [], 0
-        cur.append(i)
-        chars += len(t)
-    if cur:
-        batches.append(cur)
-    return batches
-
-
-def _preserve_ws(original: str, translated: str) -> str:
-    """Keep the leading/trailing whitespace of the original node."""
-    lead = original[: len(original) - len(original.lstrip())]
-    trail = original[len(original.rstrip()):]
-    return f"{lead}{translated.strip()}{trail}"
-
-
-async def translate_texts(session: aiohttp.ClientSession, texts: List[str], target_lang: str,
-                          sem: asyncio.Semaphore, counter: dict) -> List[str]:
-    results: List[str] = list(texts)
-    batches = make_batches(texts)
-
-    async def run(bi: int, idxs: List[int]) -> None:
-        async with sem:
-            out = await translate_batch_req(session, [texts[i] for i in idxs], target_lang, bi)
-        for i, t in zip(idxs, out):
-            results[i] = t
-        counter["done"] += len(idxs)
-
-    await asyncio.gather(*(run(bi, b) for bi, b in enumerate(batches)))
-    return results
-
-
-async def perform_translation(user_id: int, file_path: str, target_lang: str,
-                              original_name: str, status_msg) -> None:
-    book = epub.read_epub(file_path, options={"ignore_ncx": False})
-    docs = [it for it in book.get_items() if it.get_type() == ebooklib.ITEM_DOCUMENT]
-
-    # Pass 1 – parse all docs & collect nodes (so we know the total for progress)
-    parsed: List[Tuple[object, BeautifulSoup, List[NavigableString]]] = []
-    total_nodes = 0
-    for item in docs:
-        soup = BeautifulSoup(item.get_content(), "html.parser")
-        nodes = collect_text_nodes(soup)
-        parsed.append((item, soup, nodes))
-        total_nodes += len(nodes)
-
-    if total_nodes == 0:
-        raise RuntimeError("Is EPUB mein koi translatable text nahi mila.")
-
-    counter = {"done": 0}
-    last_edit = 0.0
-    sem = asyncio.Semaphore(MAX_PARALLEL_BATCHES)
-    started = time.time()
-
-    async def progress_loop() -> None:
-        nonlocal last_edit
-        while True:
-            await asyncio.sleep(4)
-            pct = int(counter["done"] * 100 / total_nodes)
-            elapsed = int(time.time() - started)
-            if time.time() - last_edit >= 4:
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ Translating to {LANGUAGES.get(target_lang, target_lang)}: {pct}%\n"
-                        f"Segments: {counter['done']}/{total_nodes}\n"
-                        f"Workers: {len(healthy_workers())}/{len(WORKERS)} online • {elapsed}s"
-                    )
-                    last_edit = time.time()
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(progress_loop())
-    try:
-        async with aiohttp.ClientSession(timeout=WORKER_TIMEOUT) as session:
-            for item, soup, nodes in parsed:
-                if not nodes:
-                    continue
-                texts = [str(n) for n in nodes]
-                translated = await translate_texts(session, texts, target_lang, sem, counter)
-                for node, t in zip(nodes, translated):
-                    if t and t != str(node):
-                        node.replace_with(NavigableString(_preserve_ws(str(node), t)))
-                item.set_content(str(soup).encode("utf-8"))
-    finally:
-        prog.cancel()
-
-    # Update language metadata so readers pick correct fonts/hyphenation
-    try:
-        book.metadata.setdefault("http://purl.org/dc/elements/1.1/", {})
-        book.set_language(target_lang)
-    except Exception:
-        pass
-
-    base = os.path.splitext(os.path.basename(original_name))[0]
-    output_file = f"{base}_{target_lang}.epub"
-    epub.write_epub(output_file, book)
-
-    took = int(time.time() - started)
-    await status_msg.edit_text("✅ Translation complete! Uploading file...")
-    try:
-        await app.send_document(
-            chat_id=user_id,
-            document=output_file,
-            caption=(f"📚 {base}\n🌐 {LANGUAGES.get(target_lang, target_lang)} • "
-                     f"{total_nodes} segments • {took}s"),
-        )
-        await status_msg.delete()
-    finally:
-        if os.path.exists(output_file):
-            os.remove(output_file)
-
-
-async def process_queue() -> None:
-    while True:
-        user_id, file_path, target_lang, original_name, status_msg = await translation_queue.get()
+async def safe_send(chat_id: int, text: str, reply_markup=None) -> Optional[Message]:
+    for _ in range(2):
         try:
-            active_tasks[user_id] = "Processing"
-            await perform_translation(user_id, file_path, target_lang, original_name, status_msg)
-            consume_quota(user_id)
-        except Exception as exc:
-            log.exception("Translation failed for %s", user_id)
-            try:
-                await status_msg.edit_text(f"❌ Translation failed: {str(exc)[:300]}")
-            except Exception:
-                pass
-        finally:
-            active_tasks.pop(user_id, None)
-            translation_queue.task_done()
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            return await app.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+        except FloodWait as fw:
+            await asyncio.sleep(min(int(fw.value), 30))
+        except Exception as exc:  # noqa: BLE001  (blocked bot, deleted account, …)
+            log.debug("send failed to %s: %s", chat_id, exc)
+            return None
+    return None
 
 
-# --------------------------------------------------------------------------- #
-# Handlers
-# --------------------------------------------------------------------------- #
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    user_id = message.from_user.id
-    get_user(user_id)
-    save_data()
-    await message.reply_text(
-        "Namaste! Main ek Super Fast EPUB Translator Bot hu.\n\n"
-        f"Free users: {FREE_DAILY_LIMIT} files/day. Premium: unlimited.\n"
-        "Menu use karein ya seedhe ek EPUB file bhejein.",
-        reply_markup=get_main_keyboard(user_id),
-    )
-
-
-@app.on_message(filters.document)
-async def handle_document(client, message):
-    user_id = message.from_user.id
-    name = (message.document.file_name or "").lower()
-    if not name.endswith(".epub"):
-        return await message.reply_text("⚠️ Kripya sirf .epub file bhejein.")
-    if not WORKERS:
-        return await message.reply_text("⚠️ Koi bhi worker online nahi hai. Owner se contact karein.")
-    if user_id in active_tasks or any(t[0] == user_id for t in list(translation_queue._queue)):
-        return await message.reply_text("⚠️ Aapki ek file pehle se queue mein hai. Kripya wait karein.")
-
-    allowed, remaining = check_daily_quota(user_id)
-    if not allowed:
-        return await message.reply_text(
-            f"⚠️ Aaj ka free limit ({FREE_DAILY_LIMIT} files) khatam. Unlimited ke liye /pay karein."
-        )
-
-    target_lang = get_user(user_id).get("lang", "hi")
-    queue_pos = translation_queue.qsize() + 1
-    status_msg = await message.reply_text(
-        f"📥 File received → {LANGUAGES.get(target_lang, target_lang)}\n"
-        f"Position in queue: {queue_pos}\nDownloading..."
-    )
+async def reply(m: Message, text: str, reply_markup=None) -> Optional[Message]:
     try:
-        file_path = await message.download(file_name=f"downloads/{user_id}_{int(time.time())}.epub")
-    except Exception as exc:
-        return await status_msg.edit_text(f"❌ Download failed: {exc}")
+        return await m.reply_text(text, reply_markup=reply_markup, disable_web_page_preview=True, quote=True)
+    except FloodWait as fw:
+        await asyncio.sleep(min(int(fw.value), 30))
+        return await safe_send(m.chat.id, text, reply_markup)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("reply failed: %s", exc)
+        return None
 
-    await status_msg.edit_text(f"✅ Download complete! Waiting in queue (Position: {queue_pos})...")
-    await translation_queue.put((user_id, file_path, target_lang, message.document.file_name, status_msg))
 
-
-@app.on_message(filters.command("pay"))
-async def pay_command(client, message):
-    user_id = message.from_user.id
-    if is_premium(user_id):
-        return await message.reply_text("⭐ Aap already premium hain. Unlimited translations enjoy karein!")
-    if rzp_client is None:
-        return await message.reply_text(
-            "💳 Premium ke liye owner se contact karein. (Payment gateway abhi configured nahi hai.)"
-        )
+async def answer(cq: CallbackQuery, text: str = "", alert: bool = False) -> None:
     try:
-        link = rzp_client.payment_link.create(data={
-            "amount": PREMIUM_PRICE_INR * 100,
-            "currency": "INR",
-            "accept_partial": False,
-            "description": "Unlimited Translation Subscription (1 Month)",
-            "notify": {"sms": False, "email": False},
-            "reminder_enable": False,
-            "notes": {"user_id": str(user_id)},
-        })
-        await message.reply_text(
-            f"Please pay ₹{PREMIUM_PRICE_INR} for 1 month unlimited access.\n"
-            f"Click here: {link['short_url']}\n\n"
-            f"Payment ke baad owner ko screenshot + apna ID `{user_id}` bhejein."
-        )
-    except Exception as exc:
-        await message.reply_text(f"Payment error: {exc}")
-
-
-@app.on_message(filters.command("premium") & filters.user(OWNER_ID))
-async def grant_premium(client, message):
-    """/premium <user_id> [days]  – owner grants premium."""
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        return await message.reply_text("Usage: /premium <user_id> [days=30]")
-    uid = int(parts[1])
-    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
-    from datetime import timedelta
-
-    u = get_user(uid)
-    u["has_subscription"] = True
-    u["premium_until"] = (date.today() + timedelta(days=days)).isoformat()
-    save_data()
-    await message.reply_text(f"✅ Premium granted to {uid} until {u['premium_until']}")
-    try:
-        await client.send_message(uid, f"⭐ Aapka premium activate ho gaya hai ({days} din).")
-    except Exception:
+        await cq.answer(text[:200], show_alert=alert)
+    except Exception:  # noqa: BLE001
         pass
 
 
-@app.on_message(filters.command("revoke") & filters.user(OWNER_ID))
-async def revoke_premium(client, message):
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        return await message.reply_text("Usage: /revoke <user_id>")
-    u = get_user(int(parts[1]))
-    u["has_subscription"] = False
-    u["premium_until"] = None
-    save_data()
-    await message.reply_text("✅ Premium revoked.")
+async def edit_cq(cq: CallbackQuery, text: str, markup=None) -> None:
+    if cq.message:
+        await safe_edit(cq.message.chat.id, cq.message.id, text, markup)
 
 
-@app.on_message(filters.command("stats") & filters.user(OWNER_ID))
-async def stats_cmd(client, message):
-    premium = sum(1 for uid in users_db if is_premium(uid) and uid != OWNER_ID)
-    lines = [f"👥 Users: {len(users_db)} (premium {premium})",
-             f"📦 Queue: {translation_queue.qsize()} • Active: {len(active_tasks)}",
-             f"🖥 Workers: {len(healthy_workers())}/{len(WORKERS)} healthy", ""]
-    for w in WORKERS:
-        s = worker_stats.get(w, {"ok": 0, "fail": 0})
-        flag = "🟢" if w in healthy_workers() else "🔴"
-        lines.append(f"{flag} {w}  ok={s['ok']} fail={s['fail']}")
-    await message.reply_text("\n".join(lines), disable_web_page_preview=True)
+async def notify_admins(text: str, reply_markup=None) -> None:
+    for uid in settings.admins:
+        await safe_send(uid, text, reply_markup)
 
 
-def _normalize_url(text: str) -> str:
-    url = text.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-    return url.rstrip("/")
+def avail(uid: int) -> dict:
+    return store.available_chars(uid, settings.free_daily_chars)
 
 
-@app.on_message(filters.text & ~filters.command(["start", "pay", "premium", "revoke", "stats"]))
-async def handle_text_buttons(client, message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    # ---- Admin state machine ----
-    if user_id == OWNER_ID and user_id in admin_state:
-        state = admin_state.pop(user_id)
-        if text == "❌ Cancel":
-            return await message.reply_text("Action cancelled.", reply_markup=get_main_keyboard(user_id))
-
-        url = _normalize_url(text)
-        if state == "ADDING_WORKER":
-            if url in WORKERS:
-                return await message.reply_text("⚠️ Worker pehle se maujood hai.", reply_markup=get_main_keyboard(user_id))
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-                ok, info = await check_worker(session, url)
-            if not ok:
-                return await message.reply_text(
-                    f"❌ Worker reachable nahi hai ({info}).\nURL check karke dobara try karein.",
-                    reply_markup=get_main_keyboard(user_id),
-                )
-            WORKERS.append(url)
-            save_data()
-            return await message.reply_text(
-                f"✅ Worker added ({info})!\nTotal workers: {len(WORKERS)}",
-                reply_markup=get_main_keyboard(user_id),
-            )
-
-        if state == "DELETING_WORKER":
-            # allow deleting by index number too
-            if text.isdigit() and 1 <= int(text) <= len(WORKERS):
-                url = WORKERS[int(text) - 1]
-            if url in WORKERS:
-                WORKERS.remove(url)
-                save_data()
-                return await message.reply_text(
-                    f"✅ Worker removed!\nTotal workers left: {len(WORKERS)}",
-                    reply_markup=get_main_keyboard(user_id),
-                )
-            return await message.reply_text("⚠️ Worker list mein nahi mila.", reply_markup=get_main_keyboard(user_id))
-
-    # ---- Menu buttons ----
-    if text == "🌐 Set Language":
-        buttons = [InlineKeyboardButton(l, callback_data=f"lang_{c}") for c, l in LANGUAGES.items()]
-        keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-        await message.reply_text("Niche apni pasandida bhasha chunein:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif text == "💳 Premium (/pay)":
-        await pay_command(client, message)
-
-    elif text == "📊 Queue Status":
-        allowed, remaining = check_daily_quota(user_id)
-        tier = "⭐ Premium" if is_premium(user_id) else f"Free ({remaining} left today)"
-        await message.reply_text(
-            f"📊 **System Status**\n\n"
-            f"Workers Online: {len(healthy_workers())}/{len(WORKERS)}\n"
-            f"Files Processing: {len(active_tasks)}\n"
-            f"Files in Queue: {translation_queue.qsize()}\n\n"
-            f"Your plan: {tier}\n"
-            f"Your language: {LANGUAGES.get(get_user(user_id).get('lang', 'hi'))}"
-        )
-
-    elif text == "❓ Help":
-        await message.reply_text(
-            "1. 🌐 Language set karein.\n"
-            "2. 📚 Apni EPUB file upload karein.\n"
-            "3. ⏳ Bot translate karke nayi EPUB bhej dega (images, TOC, CSS safe rehte hain).\n\n"
-            f"Free: {FREE_DAILY_LIMIT} files/day • Premium: unlimited (/pay)."
-        )
-
-    elif text == "➕ Add Worker" and user_id == OWNER_ID:
-        admin_state[user_id] = "ADDING_WORKER"
-        cancel_kb = ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
-        await message.reply_text("Naye worker ka URL bhejein (eg: https://app.onrender.com):", reply_markup=cancel_kb)
-
-    elif text == "➖ Del Worker" and user_id == OWNER_ID:
-        if not WORKERS:
-            return await message.reply_text("Koi worker list mein nahi hai.")
-        admin_state[user_id] = "DELETING_WORKER"
-        cancel_kb = ReplyKeyboardMarkup([[KeyboardButton("❌ Cancel")]], resize_keyboard=True)
-        listing = "\n".join(f"{i + 1}. {w}" for i, w in enumerate(WORKERS))
-        await message.reply_text(f"Worker ka URL ya number bhejein jise hatana hai:\n\n{listing}", reply_markup=cancel_kb)
-
-    elif text == "🖥 Worker List" and user_id == OWNER_ID:
-        if not WORKERS:
-            return await message.reply_text("Koi worker list mein nahi hai.")
-        msg = await message.reply_text("🔍 Checking workers...")
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            checks = await asyncio.gather(*(check_worker(session, w) for w in WORKERS))
-        lines = []
-        for i, (w, (ok, info)) in enumerate(zip(WORKERS, checks)):
-            if ok:
-                worker_failures.pop(w, None)
-            lines.append(f"{i + 1}. {'🟢' if ok else '🔴'} {w}\n    {info}")
-        await msg.edit_text("Current Workers:\n\n" + "\n".join(lines), disable_web_page_preview=True)
-
-    elif text == "🧹 Clear Stuck Tasks" and user_id == OWNER_ID:
-        active_tasks.clear()
-        worker_failures.clear()
-        await message.reply_text("✅ Stuck tasks aur worker cooldowns clear kar diye gaye.")
+def touch(obj) -> Optional[dict]:
+    u = obj.from_user
+    if not u or u.is_bot:
+        return None
+    return store.touch_user(u.id, u.username, u.first_name)
 
 
-@app.on_callback_query(filters.regex(r"^lang_"))
-async def set_language(client, callback_query):
-    lang_code = callback_query.data.split("_", 1)[1]
-    if lang_code not in LANGUAGES:
-        return await callback_query.answer("Unknown language", show_alert=True)
-    user_id = callback_query.from_user.id
-    get_user(user_id)["lang"] = lang_code
-    save_data()
-    await callback_query.answer(f"Language {LANGUAGES[lang_code]} set ho gayi hai.")
-    await callback_query.message.edit_text(
-        f"Selected Language: **{LANGUAGES[lang_code]}**\nAb apni EPUB file bhej sakte hain."
-    )
+def banned(uid: int) -> bool:
+    u = store.get_user(uid)
+    return bool(u and u.get("banned")) and not is_admin(uid)
+
+
+# --------------------------------------------------------------------------- #
+# Job callbacks  (JobManager -> Telegram)
+# --------------------------------------------------------------------------- #
+async def job_started(job: Job) -> None:
+    _last_edit[job.id] = time.time()
+    await safe_edit(job.chat_id, job.msg_id,
+                    ui.progress_text(job.title, job.lang, 0, 0, job.progress.total, 0, None,
+                                     len(pool.healthy()), len(pool)),
+                    ui.progress_keyboard(job.id))
+
+
+async def job_progress(job: Job) -> None:
+    now = time.time()
+    if now - _last_edit.get(job.id, 0) < 4:      # Telegram edit rate-limit friendly
+        return
+    _last_edit[job.id] = now
+    p = job.progress
+    await safe_edit(job.chat_id, job.msg_id,
+                    ui.progress_text(job.title, job.lang, p.pct, p.done, p.total, p.elapsed, p.eta,
+                                     len(pool.healthy()), len(pool)),
+                    ui.progress_keyboard(job.id))
+
+
+async def job_finished(job: Job, out_path: Optional[str], error: Optional[str]) -> None:
+    _last_edit.pop(job.id, None)
+    if error == "cancelled":
+        return await safe_edit(job.chat_id, job.msg_id, "✖️ Translation cancelled. Characters refund ho gaye.")
+    if error or not out_path:
+        return await safe_edit(job.chat_id, job.msg_id,
+                               f"❌ <b>Translation failed</b>\n{ui.esc(error or 'Unknown error')}\n\n"
+                               "Characters refund ho gaye. Thodi der baad dobara try karein.")
+
+    await safe_edit(job.chat_id, job.msg_id, "✅ Translation complete — uploading…")
+    p = job.progress
+    warn = f"\n⚠️ {p.failed_segments} segments untranslated (worker errors)" if p.failed_segments else ""
+    base = os.path.splitext(job.file_name)[0]
+    caption = (f"📚 <b>{ui.esc(job.title)}</b>\n🌐 {lang_name(job.lang)} • {fmt_chars(job.analysis.total_chars)} chars"
+               f" • {p.elapsed}s{warn}")
+    for attempt in range(3):
+        try:
+            await app.send_document(job.chat_id, out_path, caption=caption, file_name=f"{base}_{job.lang}.epub")
+            break
+        except FloodWait as fw:
+            await asyncio.sleep(min(int(fw.value), 60))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("upload attempt %d failed: %s", attempt + 1, exc)
+            await asyncio.sleep(2)
+    else:
+        store.refund(job.user_id, job.breakdown)
+        return await safe_edit(job.chat_id, job.msg_id, "❌ File upload failed. Characters refund ho gaye.")
+    try:
+        await app.delete_messages(job.chat_id, job.msg_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def pending_expired(p: Pending) -> None:
+    await safe_edit(p.chat_id, p.msg_id, "⌛ Request expire ho gayi — file dobara bhejein.")
+
+
+jobs.on_start, jobs.on_progress, jobs.on_finish, jobs.on_expire = job_started, job_progress, job_finished, pending_expired
+
+
+# --------------------------------------------------------------------------- #
+# User commands
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.private & filters.command(["start", "help"]))
+async def cmd_start(_, m: Message):
+    if not touch(m):
+        return
+    uid = m.from_user.id
+    state.pop(uid, None)
+    text = ui.welcome_text(m.from_user.first_name or "friend") if m.command[0] == "start" else ui.help_text()
+    await reply(m, text, ui.main_keyboard(is_admin(uid)))
+
+
+@app.on_message(filters.private & filters.command("plan"))
+async def cmd_plan(_, m: Message):
+    u = touch(m)
+    if u:
+        await reply(m, ui.plan_text(avail(m.from_user.id), u), ui.plan_keyboard())
+
+
+@app.on_message(filters.private & filters.command("lang"))
+async def cmd_lang(_, m: Message):
+    u = touch(m)
+    if u:
+        await reply(m, "🌐 Target language chunein:", ui.lang_keyboard(u["lang"]))
+
+
+@app.on_message(filters.private & filters.command(["buy", "pay"]))
+async def cmd_buy(_, m: Message):
+    if touch(m):
+        await reply(m, ui.buy_menu_text(avail(m.from_user.id)), ui.buy_menu_keyboard())
+
+
+@app.on_message(filters.private & filters.command("cancel"))
+async def cmd_cancel(_, m: Message):
+    if not touch(m):
+        return
+    uid = m.from_user.id
+    state.pop(uid, None)
+    p = jobs.user_pending(uid)
+    if p:
+        jobs.drop_pending(p.token)
+        await safe_edit(p.chat_id, p.msg_id, "✖️ Cancelled.")
+    if jobs.cancel_user(uid):
+        return await reply(m, "⏹ Job rok diya ja raha hai…")
+    await reply(m, "✖️ Cancelled." if p else "Koi active job nahi hai.")
+
+
+# --------------------------------------------------------------------------- #
+# Admin commands
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.private & filters.command("admin") & admin_only)
+async def cmd_admin(_, m: Message):
+    await reply(m, "⚙️ <b>Admin panel</b>", ui.admin_menu_keyboard())
+
+
+@app.on_message(filters.private & filters.command("stats") & admin_only)
+async def cmd_stats(_, m: Message):
+    await reply(m, stats_text())
+
+
+@app.on_message(filters.private & filters.command("workers") & admin_only)
+async def cmd_workers(_, m: Message):
+    await reply(m, await workers_text(live=True), ui.admin_workers_keyboard(pool.urls))
+
+
+@app.on_message(filters.private & filters.command(["grant", "credits", "revoke", "ban", "unban", "user"]) & admin_only)
+async def cmd_admin_user(_, m: Message):
+    """
+    /grant <uid> [days]        unlimited plan
+    /credits <uid> <millions>  add (negative = deduct)
+    /revoke <uid>              remove unlimited
+    /ban <uid> | /unban <uid>
+    /user <uid>                user card
+    """
+    cmd, args = m.command[0], m.command[1:]
+    if not args or not args[0].lstrip("-").isdigit():
+        return await reply(m, f"Usage: <code>/{cmd} &lt;user_id&gt; [value]</code>")
+    uid = int(args[0])
+    val = args[1] if len(args) > 1 else None
+
+    if cmd == "grant":
+        days = int(val) if val and val.isdigit() else settings.unlimited_days
+        until = store.grant_unlimited(uid, days)
+        await safe_send(uid, f"⭐ Aapka Unlimited plan activate ho gaya (till {until}).")
+        return await reply(m, f"✅ Unlimited granted to <code>{uid}</code> till {until}")
+    if cmd == "credits":
+        try:
+            chars = int(float(val) * MILLION) if val else 0
+        except ValueError:
+            chars = 0
+        if not chars:
+            return await reply(m, "Usage: <code>/credits &lt;user_id&gt; &lt;millions&gt;</code>")
+        bal = store.add_credits(uid, chars)
+        if chars > 0:
+            await safe_send(uid, f"💎 {fmt_chars(chars)} characters add hue. Balance: {fmt_chars(bal)}")
+        return await reply(m, f"✅ <code>{uid}</code> credits {'+' if chars > 0 else ''}{fmt_chars(chars)} → {fmt_chars(bal)}")
+    if cmd == "revoke":
+        store.revoke_unlimited(uid)
+        return await reply(m, f"✅ Unlimited revoked for <code>{uid}</code>")
+    if cmd in ("ban", "unban"):
+        store.set_banned(uid, cmd == "ban")
+        return await reply(m, f"✅ <code>{uid}</code> {'banned' if cmd == 'ban' else 'unbanned'}")
+
+    u = store.get_user(uid)
+    if not u:
+        return await reply(m, "User not found.")
+    a = avail(uid)
+    await reply(m, (f"👤 <code>{uid}</code> @{ui.esc(u.get('username') or '-')} {ui.esc(u.get('first_name'))}\n"
+                    f"lang={u['lang']} banned={u['banned']} unlimited_until={u['unlimited_until']}\n"
+                    f"credits={fmt_chars(u['credits'])} free_left={fmt_chars(a['free_left'])}\n"
+                    f"files={u['total_files']} chars={fmt_chars(u['total_chars'])}\nseen={u['last_seen']}"))
+
+
+def stats_text() -> str:
+    uc, js, rv = store.user_count(), store.job_stats(), store.revenue()
+    return "\n".join([
+        "📊 <b>Stats</b>",
+        f"👥 Users {uc['total']} • active 7d {uc['active7d']} • unlimited {uc['unlimited']}",
+        f"💎 Credits outstanding {fmt_chars(uc['credits_outstanding'])}",
+        f"📚 Jobs {js['total']} (✅{js['done']} ❌{js['failed']}) • {fmt_chars(js['chars'])} chars",
+        f"📅 Today {js['today']} jobs • {fmt_chars(js['today_chars'])} chars",
+        f"💰 Revenue ₹{rv['total_inr']} ({rv['count']} payments) • this month ₹{rv['month_inr']}",
+        f"⚙️ Queue {jobs.queue.qsize()} • running {len(jobs.running)} • workers {len(pool.healthy())}/{len(pool)}",
+    ])
+
+
+async def workers_text(live: bool = False) -> str:
+    if not pool.urls:
+        return "🖥 <b>Workers</b>\n\nKoi worker nahi. ➕ Add se shuru karein."
+    if live:
+        await pool.check_all()
+    healthy = set(pool.healthy())
+    lines = [f"🖥 <b>Workers</b>  ({len(healthy)}/{len(pool)} healthy)\n"]
+    for i, url in enumerate(pool.urls):
+        st = pool.stats.get(url, {"ok": 0, "fail": 0})
+        info = pool.last_health.get(url, (True, ""))[1]
+        lines.append(f"{i + 1}. {'🟢' if url in healthy else '🔴'} <code>{ui.esc(url.replace('https://', ''))}</code>\n"
+                     f"    ok {st['ok']} • fail {st['fail']}{(' • ' + ui.esc(info)) if info else ''}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Documents
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.private & filters.document)
+async def on_document(_, m: Message):
+    u = touch(m)
+    if not u:
+        return
+    uid = m.from_user.id
+    if banned(uid):
+        return await reply(m, "🚫 Aapka access band hai. Support se contact karein.")
+    doc = m.document
+    name = doc.file_name or "book.epub"
+    if not name.lower().endswith(".epub"):
+        return await reply(m, "⚠️ Sirf <b>.epub</b> files supported hain.")
+    if doc.file_size and doc.file_size > settings.max_file_mb * 1024 * 1024:
+        return await reply(m, f"⚠️ File {settings.max_file_mb} MB se badi hai.")
+    if not pool.urls:
+        return await reply(m, "⚠️ Abhi koi translation worker online nahi hai. Thodi der baad try karein.")
+    if jobs.has_active(uid):
+        return await reply(m, "⏳ Aapki ek file already process ho rahi hai. /cancel se rok sakte hain.")
+    old = jobs.user_pending(uid)
+    if old:
+        jobs.drop_pending(old.token)
+        await safe_edit(old.chat_id, old.msg_id, "✖️ Replaced by a new file.")
+
+    status = await reply(m, "📥 Downloading & analysing…")
+    if not status:
+        return
+    path = os.path.join(settings.download_dir, f"{uid}_{int(time.time())}.epub")
+    try:
+        got = await m.download(file_name=path)
+        if not got:
+            raise RuntimeError("download returned nothing")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("download failed: %s", exc)
+        cleanup(path)
+        return await safe_edit(m.chat.id, status.id, "❌ Download failed. Dobara bhejein.")
+
+    try:
+        p = await jobs.prepare(uid, m.chat.id, path, name, u["lang"], status.id)
+    except EpubError as exc:
+        cleanup(path)
+        return await safe_edit(m.chat.id, status.id, f"❌ {ui.esc(exc)}")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("analyse failed")
+        cleanup(path)
+        return await safe_edit(m.chat.id, status.id, f"❌ File analyse nahi ho payi ({type(exc).__name__}).")
+    await show_confirm(p.token)
+
+
+async def show_confirm(token: str) -> None:
+    p = jobs.pending.get(token)
+    if not p:
+        return
+    a = avail(p.user_id)
+    chars = p.analysis.total_chars
+    enough = a["unlimited"] or a["total"] >= chars
+    short_m = 0 if enough else max(1, -(-(chars - a["total"]) // MILLION))
+    await safe_edit(p.chat_id, p.msg_id,
+                    ui.confirm_text(p.analysis.title, p.file_name, chars, p.analysis.total_nodes, p.lang, a),
+                    ui.confirm_keyboard(token, enough, short_m))
+
+
+# --------------------------------------------------------------------------- #
+# Text: reply-keyboard buttons + conversational states
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.private & filters.text & ~filters.command(USER_CMDS + ADMIN_CMDS))
+async def on_text(_, m: Message):
+    u = touch(m)
+    if not u:
+        return
+    uid = m.from_user.id
+    text = (m.text or "").strip()
+    st = state.get(uid)
+    if st:
+        handled = await handle_state(m, uid, st, text)
+        if handled:
+            return
+
+    if text == ui.BTN_PLAN:
+        return await reply(m, ui.plan_text(avail(uid), u), ui.plan_keyboard())
+    if text == ui.BTN_LANG:
+        return await reply(m, "🌐 Target language chunein:", ui.lang_keyboard(u["lang"]))
+    if text == ui.BTN_BUY:
+        return await reply(m, ui.buy_menu_text(avail(uid)), ui.buy_menu_keyboard())
+    if text == ui.BTN_ADMIN and is_admin(uid):
+        return await reply(m, "⚙️ <b>Admin panel</b>", ui.admin_menu_keyboard())
+    await reply(m, "📎 Translate karne ke liye <b>.epub</b> file bhejein. Help: /help", ui.main_keyboard(is_admin(uid)))
+
+
+async def handle_state(m: Message, uid: int, st: dict, text: str) -> bool:
+    mode = st.get("mode")
+
+    if mode == "custom_credits":
+        mm = parse_millions(text)
+        if mm is None:
+            await reply(m, f"⚠️ {settings.min_credit_millions}–{settings.max_credit_millions} ke beech number bhejein "
+                           f"(e.g. <code>4</code> = 4M characters = ₹{credits_price(4)}).", ui.cancel_keyboard("buy:menu"))
+            return True
+        state.pop(uid, None)
+        await reply(m, method_text("credits", mm), ui.pay_method_keyboard("credits", mm, rzp.enabled, bool(settings.upi_id)))
+        return True
+
+    if mode == "upi_utr":
+        utr = text.replace(" ", "")
+        if not (8 <= len(utr) <= 40) or not utr.isalnum():
+            await reply(m, "⚠️ Valid UTR / transaction ID bhejein (usually 12 digit number).",
+                        ui.cancel_keyboard(f"pay:abort:{st['payment_id']}"))
+            return True
+        pay = store.get_payment(st["payment_id"])
+        state.pop(uid, None)
+        if not pay or pay["status"] not in ("created", "pending"):
+            await reply(m, "Yeh request ab valid nahi hai. /buy se dobara shuru karein.")
+            return True
+        store.set_payment_status(pay["id"], "pending", ref=utr)
+        desc, amt = plan_summary(pay["kind"], pay["millions"])
+        await reply(m, "🕒 Shukriya! Payment verify hone ke baad plan turant activate ho jayega (usually kuch minute).")
+        await notify_admins(f"💰 <b>UPI payment review</b> #{pay['id']}\nUser: <code>{uid}</code> "
+                            f"@{ui.esc(m.from_user.username or '-')}\nPlan: {desc} — ₹{amt}\nUTR: <code>{ui.esc(utr)}</code>",
+                            ui.admin_review_keyboard(pay["id"]))
+        return True
+
+    if not is_admin(uid):
+        state.pop(uid, None)
+        return False
+
+    if mode == "add_worker":
+        state.pop(uid, None)
+        url = pool.normalize(text)
+        if url in pool.urls:
+            await reply(m, "⚠️ Worker already added.", ui.back_keyboard("adm:workers"))
+            return True
+        ok, info = await pool.check(url)
+        if not ok:
+            await reply(m, f"❌ Worker reachable nahi ({ui.esc(info)}). URL check karein.", ui.back_keyboard("adm:workers"))
+            return True
+        pool.add(url)
+        await reply(m, f"✅ Worker added — {ui.esc(info)}\nTotal: {len(pool)}", ui.back_keyboard("adm:workers"))
+        return True
+
+    if mode == "broadcast":
+        state.pop(uid, None)
+        asyncio.create_task(broadcast(uid, text))
+        await reply(m, "📣 Broadcast started…")
+        return True
+
+    state.pop(uid, None)
+    return False
+
+
+def method_text(kind: str, millions: int) -> str:
+    desc, amt = plan_summary(kind, millions)
+    return f"🧾 <b>{desc}</b> — <b>₹{amt}</b>\n\nPayment method chunein:"
+
+
+async def broadcast(admin_id: int, text: str) -> None:
+    sent = failed = 0
+    for uid in store.all_user_ids():
+        if await safe_send(uid, text):
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    await safe_send(admin_id, f"📣 Broadcast done: sent {sent}, failed {failed}")
+
+
+# --------------------------------------------------------------------------- #
+# Callback queries
+# --------------------------------------------------------------------------- #
+@app.on_callback_query()
+async def on_callback(_, cq: CallbackQuery):
+    u = touch(cq)
+    if not u:
+        return await answer(cq)
+    uid = cq.from_user.id
+    data = cq.data or ""
+    parts = data.split(":")
+    head = parts[0]
+    try:
+        if head == "noop":
+            return await answer(cq)
+        if head == "cancel":
+            state.pop(uid, None)
+            await answer(cq, "Cancelled")
+            return await edit_cq(cq, "✖️ Cancelled.")
+        if head == "lang" and len(parts) >= 2:
+            return await cb_lang(cq, uid, parts)
+        if head == "langpg" and len(parts) >= 2 and parts[1].isdigit():
+            back = ":".join(parts[2:])
+            back = None if back in ("", "-") else back
+            return await edit_cq(cq, "🌐 Target language chunein:", ui.lang_keyboard(u["lang"], int(parts[1]), back))
+        if head == "job" and len(parts) >= 3:
+            return await cb_job(cq, uid, parts)
+        if head == "me" and len(parts) >= 2:
+            return await cb_me(cq, uid, parts)
+        if head == "buy" and len(parts) >= 2:
+            return await cb_buy(cq, uid, parts)
+        if head == "pay" and len(parts) >= 2:
+            return await cb_pay(cq, uid, parts)
+        if head == "adm" and len(parts) >= 2:
+            if not is_admin(uid):
+                return await answer(cq, "Admins only", True)
+            return await cb_admin(cq, uid, parts)
+        await answer(cq)
+    except Exception:  # noqa: BLE001
+        log.exception("callback failed: %s", data)
+        await answer(cq, "Kuch galat ho gaya, dobara try karein.", True)
+
+
+async def cb_lang(cq: CallbackQuery, uid: int, parts: list) -> None:
+    code = parts[1]
+    if code not in LANGUAGES:
+        return await answer(cq, "Unknown language", True)
+    store.set_lang(uid, code)
+    back = ":".join(parts[3:])
+    back = None if back in ("", "-") else back
+    await answer(cq, f"✅ {lang_name(code)}")
+    if back and back.startswith("job:view:"):
+        token = back.split(":")[2]
+        p = jobs.pending.get(token)
+        if p and p.user_id == uid:
+            p.lang = code
+            return await show_confirm(token)
+    await edit_cq(cq, f"🌐 Language: <b>{lang_name(code)}</b>\nAb <b>.epub</b> file bhejein.")
+
+
+async def cb_job(cq: CallbackQuery, uid: int, parts: list) -> None:
+    action, ref = parts[1], parts[2]
+    if action == "stop":
+        jid = int(ref) if ref.isdigit() else -1
+        job = jobs.running.get(jid) or jobs.queued_job(jid)
+        if not job or (job.user_id != uid and not is_admin(uid)):
+            return await answer(cq, "Job nahi mila", True)
+        jobs.cancel_job(job.id)
+        return await answer(cq, "⏹ Cancelling…")
+
+    p = jobs.pending.get(ref)
+    if not p or p.user_id != uid:
+        await answer(cq, "Yeh request expire ho gayi. File dobara bhejein.", True)
+        return await edit_cq(cq, "⌛ Expired — file dobara bhejein.")
+    if action == "cancel":
+        jobs.drop_pending(ref)
+        await answer(cq, "Cancelled")
+        return await edit_cq(cq, "✖️ Cancelled.")
+    if action == "lang":
+        await answer(cq)
+        return await edit_cq(cq, "🌐 Is file ke liye language chunein:", ui.lang_keyboard(p.lang, 0, f"job:view:{ref}"))
+    if action == "view":
+        await answer(cq)
+        return await show_confirm(ref)
+    if action == "start":
+        if jobs.has_active(uid):
+            return await answer(cq, "Ek job already chal raha hai.", True)
+        if not pool.urls:
+            return await answer(cq, "Koi worker online nahi hai.", True)
+        try:
+            breakdown = store.consume(uid, p.analysis.total_chars, settings.free_daily_chars)
+        except ValueError:
+            await answer(cq, "Balance kam hai.", True)
+            return await show_confirm(ref)
+        job = await jobs.enqueue(p, breakdown)
+        pos = jobs.position(job)
+        await answer(cq, "✅ Queued")
+        wait = f"Queue position: {pos}" if pos > 0 and len(jobs.running) >= settings.max_concurrent_jobs else "Starting…"
+        return await edit_cq(cq, f"🕒 <b>{ui.esc(job.title)}</b> → {lang_name(job.lang)}\n{wait}",
+                             ui.progress_keyboard(job.id))
+    await answer(cq)
+
+
+async def cb_me(cq: CallbackQuery, uid: int, parts: list) -> None:
+    if parts[1] == "history":
+        rows = store.recent_jobs(uid, 8)
+        if not rows:
+            return await answer(cq, "Abhi koi history nahi.", True)
+        icon = {"done": "✅", "failed": "❌", "cancelled": "✖️", "running": "⏳", "queued": "🕒"}
+        lines = [f"{icon.get(r['status'], '•')} {ui.esc(r['file_name'] or 'book')} → {lang_name(r['lang'] or '')} "
+                 f"• {fmt_chars(r['chars'])}" for r in rows]
+        await answer(cq)
+        return await edit_cq(cq, "📜 <b>Recent files</b>\n" + "\n".join(lines), ui.plan_keyboard())
+    await answer(cq)
+
+
+async def cb_buy(cq: CallbackQuery, uid: int, parts: list) -> None:
+    what = parts[1]
+    if what == "menu":
+        state.pop(uid, None)
+        await answer(cq)
+        return await edit_cq(cq, ui.buy_menu_text(avail(uid)), ui.buy_menu_keyboard())
+    if what == "custom":
+        state[uid] = {"mode": "custom_credits"}
+        await answer(cq)
+        return await edit_cq(cq,
+                             f"✏️ Kitne <b>million characters</b> chahiye? Number bhejein "
+                             f"({settings.min_credit_millions}–{settings.max_credit_millions}).\n"
+                             f"₹{settings.credit_price_per_million_inr} per 1M — e.g. <code>6</code> = 6M = ₹{credits_price(6)}",
+                             ui.cancel_keyboard("buy:menu"))
+    if what == "unlimited":
+        await answer(cq, "Unlimited already active — aage badhne se extend hoga." if store.is_unlimited(uid) else "")
+        return await edit_cq(cq, method_text("unlimited", 0),
+                             ui.pay_method_keyboard("unlimited", 0, rzp.enabled, bool(settings.upi_id)))
+    if what == "credits":
+        mm = parse_millions(parts[2]) if len(parts) > 2 else None
+        if mm is None:
+            return await answer(cq, "Invalid amount", True)
+        await answer(cq)
+        return await edit_cq(cq, method_text("credits", mm),
+                             ui.pay_method_keyboard("credits", mm, rzp.enabled, bool(settings.upi_id)))
+    await answer(cq)
+
+
+async def cb_pay(cq: CallbackQuery, uid: int, parts: list) -> None:
+    what = parts[1]
+    if what == "contact":
+        msg = f"Payment ke liye contact karein: {settings.support_contact}" if settings.support_contact \
+            else "Payment gateway abhi set nahi hai. Admin se contact karein."
+        return await answer(cq, msg, True)
+
+    if what in ("rzp", "upi") and len(parts) >= 4:
+        kind, mm_raw = parts[2], parts[3]
+        mm = int(mm_raw) if mm_raw.isdigit() else -1
+        if kind not in ("unlimited", "credits") or (kind == "credits" and parse_millions(str(mm)) is None):
+            return await answer(cq, "Invalid plan", True)
+        desc, amt = plan_summary(kind, mm)
+        for old in store.pending_payments(uid):              # one open payment per user
+            store.set_payment_status(old["id"], "expired", note="replaced")
+
+        if what == "rzp":
+            if not rzp.enabled:
+                return await answer(cq, "Online payment unavailable", True)
+            pid = store.create_payment(uid, kind, mm, amt, "razorpay")
+            try:
+                link_id, url = await rzp.create_link(uid, kind, mm, amt, pid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("razorpay link failed: %s", exc)
+                store.set_payment_status(pid, "expired", note="link_failed")
+                return await answer(cq, "Payment link nahi ban paya, thodi der baad try karein.", True)
+            store.set_payment_status(pid, "pending", ref=link_id)
+            await answer(cq)
+            return await edit_cq(cq, f"🧾 <b>{desc}</b> — ₹{amt}\n\nNiche button se payment karein, phir "
+                                     "<b>Verify payment</b> dabayein. Plan turant activate ho jayega.",
+                                 ui.rzp_keyboard(url, pid))
+
+        if not settings.upi_id:
+            return await answer(cq, "UPI unavailable", True)
+        pid = store.create_payment(uid, kind, mm, amt, "upi")
+        note = f"EPUB{pid}"
+        state[uid] = {"mode": "upi_utr", "payment_id": pid}
+        await answer(cq)
+        return await edit_cq(cq,
+                             f"🧾 <b>{desc}</b> — <b>₹{amt}</b>\n\n"
+                             f"UPI ID: <code>{ui.esc(settings.upi_id)}</code>\nName: {ui.esc(settings.upi_name)}\n"
+                             f"Amount: <code>{amt}</code> • Note: <code>{note}</code>\n\n"
+                             "Payment ke baad <b>UTR / Transaction ID</b> yahan bhejein.",
+                             ui.upi_keyboard(pid))
+
+    pid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    pay = store.get_payment(pid)
+    if not pay or pay["user_id"] != uid:
+        return await answer(cq, "Payment nahi mila", True)
+    if what == "abort":
+        state.pop(uid, None)
+        if pay["status"] in ("created", "pending"):
+            store.set_payment_status(pid, "expired", note="user_abort")
+        await answer(cq, "Cancelled")
+        return await edit_cq(cq, "✖️ Payment cancelled.", ui.back_keyboard("buy:menu"))
+    if what == "check":
+        if pay["status"] == "paid":
+            return await answer(cq, "Already activated ✅", True)
+        if pay["method"] != "razorpay" or not pay["ref"]:
+            return await answer(cq, "Manual verification pending.", True)
+        paid = await rzp.is_paid(pay["ref"])
+        if paid is None:
+            return await answer(cq, "Verify nahi ho paya, 1 min baad try karein.", True)
+        if not paid:
+            return await answer(cq, "Payment abhi receive nahi hua. Pay karke dobara verify karein.", True)
+        msg = fulfil(store, pay, note="auto_verified")
+        await answer(cq, "✅ Activated!")
+        await edit_cq(cq, f"✅ <b>Payment received!</b>\n{msg}", ui.plan_keyboard())
+        return await notify_admins(f"💰 Razorpay paid #{pid} • <code>{uid}</code> • ₹{pay['amount_inr']} • "
+                                   f"{pay['kind']} {pay['millions']}M")
+    await answer(cq)
+
+
+# ---- admin callbacks -------------------------------------------------------- #
+async def cb_admin(cq: CallbackQuery, uid: int, parts: list) -> None:
+    sect = parts[1]
+    if sect == "menu":
+        state.pop(uid, None)
+        await answer(cq)
+        return await edit_cq(cq, "⚙️ <b>Admin panel</b>", ui.admin_menu_keyboard())
+    if sect == "stats":
+        await answer(cq)
+        return await edit_cq(cq, stats_text(), ui.back_keyboard("adm:menu"))
+    if sect == "workers":
+        await answer(cq)
+        return await edit_cq(cq, await workers_text(), ui.admin_workers_keyboard(pool.urls))
+    if sect == "w" and len(parts) >= 3:
+        act = parts[2]
+        if act == "add":
+            state[uid] = {"mode": "add_worker"}
+            await answer(cq)
+            return await edit_cq(cq, "➕ Worker URL bhejein (e.g. <code>https://xyz.onrender.com</code>):",
+                                 ui.cancel_keyboard("adm:workers"))
+        if act == "del":
+            await answer(cq)
+            return await edit_cq(cq, "➖ Kaunsa worker hatana hai?", ui.admin_del_keyboard(pool.urls))
+        if act == "rm" and len(parts) >= 4 and parts[3].isdigit():
+            i = int(parts[3])
+            if 0 <= i < len(pool.urls):
+                pool.remove(pool.urls[i])
+                await answer(cq, "Removed")
+            return await edit_cq(cq, await workers_text(), ui.admin_workers_keyboard(pool.urls))
+        if act == "ping":
+            await answer(cq, "Pinging…")
+            return await edit_cq(cq, await workers_text(live=True), ui.admin_workers_keyboard(pool.urls))
+    if sect == "payments":
+        rows = [r for r in store.pending_payments(method="upi") if r["ref"]]
+        await answer(cq)
+        if not rows:
+            return await edit_cq(cq, "💰 Koi pending UPI payment nahi.", ui.back_keyboard("adm:menu"))
+        r = rows[0]
+        desc, amt = plan_summary(r["kind"], r["millions"])
+        return await edit_cq(cq, f"💰 <b>Pending #{r['id']}</b> ({len(rows)} total)\nUser <code>{r['user_id']}</code>\n"
+                                 f"{desc} — ₹{amt}\nUTR <code>{ui.esc(r['ref'])}</code>\n{r['created_at']}",
+                             ui.admin_review_keyboard(r["id"]))
+    if sect == "pay" and len(parts) >= 4 and parts[3].isdigit():
+        decision, pid = parts[2], int(parts[3])
+        pay = store.get_payment(pid)
+        if not pay:
+            return await answer(cq, "Not found", True)
+        if pay["status"] != "pending":
+            return await answer(cq, f"Already {pay['status']}", True)
+        if decision == "ok":
+            msg = fulfil(store, pay, note=f"approved_by_{uid}")
+            await safe_send(pay["user_id"], f"✅ <b>Payment verified!</b>\n{msg}", ui.plan_keyboard())
+            await answer(cq, "Approved ✅")
+            return await edit_cq(cq, f"✅ Approved #{pid} — {msg}", ui.back_keyboard("adm:payments"))
+        store.set_payment_status(pid, "rejected", note=f"rejected_by_{uid}")
+        await safe_send(pay["user_id"], f"❌ Payment #{pid} verify nahi ho paya. Agar aapne pay kiya hai to "
+                                        "sahi UTR ke saath /buy se dobara request karein.")
+        await answer(cq, "Rejected")
+        return await edit_cq(cq, f"❌ Rejected #{pid}", ui.back_keyboard("adm:payments"))
+    if sect == "bcast":
+        state[uid] = {"mode": "broadcast"}
+        await answer(cq)
+        return await edit_cq(cq, "📣 Broadcast message bhejein (HTML ok):", ui.cancel_keyboard("adm:menu"))
+    if sect == "maint":
+        await answer(cq)
+        return await edit_cq(cq, "🧹 <b>Maintenance</b>", ui.admin_maint_keyboard())
+    if sect == "m" and len(parts) >= 3:
+        act = parts[2]
+        if act == "cooldown":
+            pool.fail_at.clear()
+            await answer(cq, "Cooldowns cleared")
+        elif act == "killjobs":
+            await answer(cq, f"{jobs.cancel_all()} jobs cancelled")
+        elif act == "expire":
+            await answer(cq, f"{store.expire_old_pending(hours=24)} expired")
+        return await edit_cq(cq, "🧹 <b>Maintenance</b>", ui.admin_maint_keyboard())
+    await answer(cq)
 
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
 async def main() -> None:
-    os.makedirs("downloads", exist_ok=True)
+    for f in os.listdir(settings.download_dir):            # leftovers from a previous crash
+        cleanup(os.path.join(settings.download_dir, f))
+
     await app.start()
-    asyncio.create_task(keep_workers_alive())
-    asyncio.create_task(process_queue())
-    log.info("Master Bot started. Workers: %d, users: %d", len(WORKERS), len(users_db))
-    await idle()
+    me = await app.get_me()
+    jobs.start()
+    keepalive = asyncio.create_task(pool.keepalive_loop(), name="keepalive")
+    log.info("Bot @%s started • workers=%d • users=%d", me.username, len(pool), store.user_count()["total"])
+    await notify_admins(f"🟢 Bot restarted • workers {len(pool)}")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    await stop.wait()
+
+    log.info("Shutting down…")
+    keepalive.cancel()
+    await jobs.stop()
+    await pool.close()
     await app.stop()
+    store.close()
 
 
 if __name__ == "__main__":
-    if not (API_ID and API_HASH and BOT_TOKEN):
-        raise SystemExit("API_ID, API_HASH aur BOT_TOKEN environment variables set karein (.env dekhein).")
-    app.run(main())
+    try:
+        app.run(main())
+    except KeyboardInterrupt:
+        pass

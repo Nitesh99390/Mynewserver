@@ -1,0 +1,22 @@
+# Render Blueprint – deploy the translation worker on the free tier.
+# Dashboard → New → Blueprint → select this repo.  Repeat with a different
+# `name` (or fork) to run several workers; add each URL in the bot's admin panel.
+services:
+  - type: web
+    name: epub-translator-worker
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: WORKER_SECRET
+        sync: false            # set in dashboard – must equal the bot's WORKER_SECRET
+      - key: MAX_CONCURRENCY
+        value: "8"
+      - key: MAX_INFLIGHT
+        value: "16"
