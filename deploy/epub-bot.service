@@ -1,0 +1,27 @@
+# systemd unit for the master bot on an Oracle / Ubuntu VPS
+#   sudo cp deploy/epub-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now epub-bot
+#   journalctl -u epub-bot -f
+[Unit]
+Description=EPUB Translator Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/epub-translator
+EnvironmentFile=/home/ubuntu/epub-translator/.env
+ExecStart=/home/ubuntu/epub-translator/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+LimitNOFILE=65536
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,7 @@
-pyrogram>=2.0
-tgcrypto
-aiohttp
-ebooklib
-beautifulsoup4
-lxml
-python-dotenv
-razorpay
+# Master bot (bot.py) – your VPS
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+aiohttp>=3.9
+beautifulsoup4>=4.12
+lxml>=5.0
+python-dotenv>=1.0
