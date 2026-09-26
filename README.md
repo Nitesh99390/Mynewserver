@@ -4,7 +4,7 @@ Telegram bot jo EPUB books ko 30+ bhashaon mein translate karta hai — **images
 
 | File | Role | Kahan chalega |
 |------|------|---------------|
-| `bot.py` + `core/` | **Master bot** — Telegram, users, plans, payments, queue, EPUB rebuild | Aapka Oracle VPS (12 GB) |
+| `bot.py` (**single file**) | **Master bot** — Telegram, users, plans, payments, queue, EPUB rebuild, worker manager. **Kabhi Google ko request nahi bhejta** — sirf workers ko | Aapka Oracle VPS (12 GB) |
 | `app.py` | **Worker** — stateless FastAPI service, text batches translate karta hai | Render / Vercel free tier (jitne chahiye) |
 
 Master bot batches ko sab workers pe **load-balance** karta hai (least-loaded → fastest), fail hone par doosre worker pe **failover**, aur free-tier hosts ko sone se rokne ke liye **keep-alive ping** karta hai.
@@ -134,15 +134,16 @@ python -m pytest tests -q        # 31 tests: store/quota/refunds, pricing parser
 ## 📁 Layout
 
 ```
-bot.py                Telegram handlers + entrypoint
-core/config.py        env → Settings, LANGUAGES
-core/store.py         SQLite (users, credits, payments, jobs, workers)
-core/workers.py       WorkerPool: least-loaded routing, failover, keep-alive
-core/epub_engine.py   analyse → translate → in-place ZIP rebuild
-core/jobs.py          pending confirm, queue, runners, refunds, janitor
-core/payments.py      pricing, Razorpay (aiohttp), UPI, fulfil
-core/ui.py            texts + minimal keyboards
-app.py                translation worker (FastAPI)
+bot.py                MASTER — ek hi file (Oracle VPS pe sirf yeh + requirements-bot.txt + .env chahiye)
+                        ├ Configuration (env → Settings, LANGUAGES)
+                        ├ Storage (SQLite: users, credits, payments, jobs, workers)
+                        ├ Plans & payments (pricing, Razorpay, UPI, fulfil)
+                        ├ EPUB engine (analyse → batch → in-place ZIP rebuild)
+                        ├ WorkerPool (least-loaded routing, failover, cooldown, keep-alive)
+                        ├ JobManager (pending confirm, queue, runners, refunds, janitor)
+                        ├ UI (texts + keyboards)
+                        └ Telegram handlers + entrypoint
+app.py                WORKER — translation service (FastAPI); yahi Google ko call karta hai
 api/index.py          Vercel entry • render.yaml • vercel.json
 deploy/               systemd unit + install script
 tests/                pytest suite

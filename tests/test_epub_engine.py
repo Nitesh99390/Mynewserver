@@ -4,8 +4,8 @@ import zipfile
 
 import pytest
 
-from core import epub_engine
-from core.epub_engine import EpubError, analyse, make_batches
+import bot as epub_engine
+from bot import EpubError, analyse, make_batches
 
 CONTAINER = """<?xml version="1.0"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
